@@ -127,9 +127,8 @@ CORE_DOCUMENTS = {
 
 # ==================== 正则表达式 ====================
 
-STAGE_FILE_PATTERN = re.compile(r"^Stage-(\d+)_(.+)\.todos\.md$")
-# 修正：TODO 行实际是 ### 开头（三级标题 + 列表项）
-# 使用非贪婪匹配避免 title 中包含 ] 导致解析失败
+# V2.0 单文件系统：不再需要 Stage 文件模式
+# TODO 行格式：### - [ ] [0001] 任务标题
 TODO_LINE_PATTERN = re.compile(
     r"^###\s+-\s*\[(?P<status>[ xX])\]\s+\[(?P<todo_id>[^\]]+?)\]\s+(?P<title>.+)$"
 )
@@ -257,14 +256,14 @@ ISSUE_BODY_TEMPLATE = """## 📋 任务概览
 
 # ==================== 辅助函数 ====================
 
-def extract_stage_number_from_filename(path: Path) -> int:
-    match = STAGE_FILE_PATTERN.match(path.name)
-    if not match:
-        raise ValueError(f"无法解析 Stage 编号: {path.name}")
-    return int(match.group(1))
+def extract_stage_number_from_todo_id(todo_id: str) -> int:
+    """从 TODO ID 中提取阶段编号（V2.0 系统）
 
-def stage_file_sort_key(path: Path) -> tuple[int, str]:
-    return extract_stage_number_from_filename(path), path.name
+    V2.0 系统所有 TODO 在一个文件中，没有 Stage 文件概念。
+    为了兼容现有代码，我们统一返回 Stage 1。
+    """
+    # V2.0 系统：所有任务都属于同一个"虚拟 Stage"
+    return 1
 
 # ==================== GitHub 客户端 ====================
 
@@ -553,7 +552,11 @@ def check_copilot_signal(github: GitHubClient, pr_number: int) -> bool:
 # ==================== 解析器 ====================
 
 def parse_stage_structure(path: Path) -> tuple[int, List[TodoItem]]:
-    stage_num = extract_stage_number_from_filename(path)
+    """解析单个 TODO 文件（V2.0 系统）
+
+    V2.0 系统：所有 TODO 在一个文件中，统一返回 Stage 1
+    """
+    stage_num = 1  # V2.0 系统：所有任务属于同一个虚拟 Stage
     logger.info(f"解析 {path.name}")
 
     if not path.exists():
@@ -584,26 +587,26 @@ def parse_stage_structure(path: Path) -> tuple[int, List[TodoItem]]:
         # 跳过已完成的任务
         if match.group("status").lower() == "x":
             logger.debug(f"跳过已完成任务: {match.group('todo_id')}")
-            # 跳过该任务的元信息块，直到下一个 TODO 或 Group Header
+            # 跳过该任务的元信息块，直到下一个 TODO 或阶段标题
             idx += 1
             while idx < total_lines:
                 next_line = lines[idx]
-                if TODO_LINE_PATTERN.match(next_line) or (next_line.strip().startswith('##') and 'Group' in next_line):
+                # V2.0: 检测下一个 TODO 或阶段标题（## 开头）
+                if TODO_LINE_PATTERN.match(next_line) or next_line.strip().startswith('##'):
                     break
                 idx += 1
-            # idx 现在指向下一个 TODO 或 Group，继续外层循环
             continue
 
         todo_id = match.group("todo_id").strip()
         title = match.group("title").strip()
 
-        # 提取元信息：读取直到下一个 TODO 或 Group Header
+        # 提取元信息：读取直到下一个 TODO 或阶段标题
         meta = []
         j = idx + 1
         while j < total_lines:
             meta_line = lines[j]
-            # 检测下一个 TODO 或分组标题
-            if TODO_LINE_PATTERN.match(meta_line) or (meta_line.strip().startswith('##') and 'Group' in meta_line):
+            # V2.0: 检测下一个 TODO 或阶段标题
+            if TODO_LINE_PATTERN.match(meta_line) or meta_line.strip().startswith('##'):
                 break
             meta.append(meta_line)
             j += 1
@@ -612,7 +615,6 @@ def parse_stage_structure(path: Path) -> tuple[int, List[TodoItem]]:
         while meta and (not meta[-1].strip() or meta[-1].strip() == '---'):
             meta.pop()
 
-        # 如果 meta 为空，记录调试信息但继续
         if not meta:
             logger.debug(f"TODO {todo_id} 没有元信息")
         else:
@@ -627,7 +629,7 @@ def parse_stage_structure(path: Path) -> tuple[int, List[TodoItem]]:
 def iter_work_items(todo_file: Path, batch_size: int, completed_ids: set[str]) -> List[WorkItem]:
     """获取当前需要处理的工作项（从单个TODO文件中提取）
 
-    新系统：所有TODO都在一个 novel-creation.todos.md 文件中，
+    V2.0 系统：所有TODO都在一个 novel-creation.todos.md 文件中，
     按顺序执行，无需Stage锁定机制。
 
     Args:
@@ -646,46 +648,61 @@ def iter_work_items(todo_file: Path, batch_size: int, completed_ids: set[str]) -
         logger.error(f"TODO 路径不是文件: {todo_file}")
         return []
 
-    files = [todo_file]  # 单文件系统，只有一个文件
-
-    # 修复：确保 batch_size 至少为 1（原子执行原则）
+    # V2.0 系统：单文件
     batch_size = max(1, batch_size)
 
-    for path in files:
-        stage_num, todos = parse_stage_structure(path)
-        if not todos:
+    stage_num, todos = parse_stage_structure(todo_file)
+    if not todos:
+        logger.info("未找到待处理的 TODO 任务")
+        return []
+
+    # 按 batch_size 分组
+    batches = [todos[i:i + batch_size] for i in range(0, len(todos), batch_size)]
+
+    work_items: List[WorkItem] = []
+    for i, batch in enumerate(batches, 1):
+        if len(batch) == 1:
+            # 单个任务
+            work_items.append(WorkItem(
+                batch[0].id_full,
+                stage_num,
+                batch[0].title,
+                todo_file,
+                batch
+            ))
+        else:
+            # 批次任务
+            wid = f"BATCH-{i:03d}"
+            title = f"批次 {i}/{len(batches)} ({len(batch)}个任务)"
+            work_items.append(WorkItem(
+                wid,
+                stage_num,
+                title,
+                todo_file,
+                batch,
+                i,
+                len(batches)
+            ))
+
+    # 过滤已完成的任务
+    filtered_items: List[WorkItem] = []
+    for item in work_items:
+        if item.id_full in completed_ids:
+            logger.info(f"⏭ 跳过已完成任务/批次 (GitHub): {item.id_full}")
             continue
 
-        batches = [todos[i:i + batch_size] for i in range(0, len(todos), batch_size)]
-
-        stage_items: List[WorkItem] = []
-        for i, batch in enumerate(batches, 1):
-            if len(batch) == 1:
-                stage_items.append(WorkItem(batch[0].id_full, stage_num, batch[0].title, path, batch))
-            else:
-                wid = f"S{stage_num:02d}-BATCH-{i:02d}"
-                title = f"{path.stem} 批次 {i}/{len(batches)}"
-                stage_items.append(WorkItem(wid, stage_num, title, path, batch, i, len(batches)))
-
-        filtered_items: List[WorkItem] = []
-        for item in stage_items:
-            if item.id_full in completed_ids:
-                logger.info(f"⏭ 跳过已完成任务/批次 (GitHub): {item.id_full}")
+        if item.is_batch:
+            all_sub_completed = all(todo.id_full in completed_ids for todo in item.todos)
+            if all_sub_completed:
+                logger.info(f"⏭ 跳过已完成批次 (子任务全清): {item.id_full}")
                 continue
 
-            if item.is_batch:
-                all_sub_completed = all(todo.id_full in completed_ids for todo in item.todos)
-                if all_sub_completed:
-                    logger.info(f"⏭ 跳过已完成批次 (子任务全清): {item.id_full}")
-                    continue
+        filtered_items.append(item)
 
-            filtered_items.append(item)
+    if filtered_items:
+        logger.info(f"待处理 {len(filtered_items)} 个工作项（共 {sum(len(item.todos) for item in filtered_items)} 个TODO）")
 
-        if filtered_items:
-            logger.info(f"锁定 Stage {stage_num:02d}，待处理 {len(filtered_items)} 个任务")
-            return filtered_items
-
-    return []
+    return filtered_items
 
 # ==================== Pipeline ====================
 
